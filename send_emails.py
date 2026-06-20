@@ -1,22 +1,25 @@
 """
-AI Email Sender v3 — Production-Grade Bulk Email Tool
-=====================================================
-Features:
-- Status column tracking in Excel (empty / email sent / sent twice)
-- Resume from crash — skips already-sent rows automatically
-- Dry-run mode — preview drafts without sending
-- Test recipient override — send entire batch to yourself for QA
-- Email validation + duplicate detection
-- Daily send cap with auto-pause
-- Retry with exponential backoff on transient failures
-- Reply tracking via Gmail IMAP (optional)
-- Parallel drafting — pre-drafts all emails, then sends with delays
+AI Email Sender v4 — Draft → Edit → Send Flow
+==============================================
+The correct workflow:
 
-Usage:
-  python send_emails.py                  # normal run
-  python send_emails.py --dry-run        # draft only, no sending
-  python send_emails.py --test           # send all to TEST_EMAIL
-  python send_emails.py --check-replies  # only check for replies
+  Step 1:  python send_emails.py --draft
+           AI generates all emails and saves them to drafts.json
+           You edit drafts.json to tweak any email you want
+
+  Step 2:  python send_emails.py --test
+           Reads YOUR edited drafts.json
+           Sends everything to TEST_EMAIL so you can verify in your inbox
+
+  Step 3:  python send_emails.py --send
+           Reads the SAME drafts.json (your edited version)
+           Sends to real recipients with delays
+
+  Optional: python send_emails.py --check-replies
+           Scans Gmail inbox for replies, updates Excel status
+
+Key principle: The AI runs ONCE (--draft). Every subsequent mode
+reads from YOUR edited file — never re-generates.
 """
 
 import os
@@ -26,7 +29,6 @@ import time
 import random
 import smtplib
 import imaplib
-import email as email_lib
 import logging
 import json
 import re
@@ -52,26 +54,24 @@ EXCEL_FILE      = "contacts.xlsx"
 CONTEXT_FILE    = "context.md"
 ATTACHMENTS_DIR = "attachments"
 LOG_FILE        = "sent_log.csv"
-DRAFTS_FILE     = "drafts_preview.txt"
-MODEL           = "phi4-mini"
+DRAFTS_FILE     = "drafts.json"          # machine-readable, you edit this
+PREVIEW_FILE    = "drafts_preview.txt"   # human-readable preview (auto-generated from drafts.json)
 
+MODEL          = os.getenv("OLLAMA_MODEL", "gemma4:e4b")
 GMAIL_USER     = os.getenv("GMAIL_USER")
 GMAIL_APP_PASS = os.getenv("GMAIL_APP_PASSWORD")
 SENDER_NAME    = os.getenv("SENDER_NAME", "Your Name")
-TEST_EMAIL     = os.getenv("TEST_EMAIL", "")   # used in --test mode
+TEST_EMAIL     = os.getenv("TEST_EMAIL", "")
 
-DELAY_MIN      = int(os.getenv("DELAY_MIN_SECONDS", "30"))
-DELAY_MAX      = int(os.getenv("DELAY_MAX_SECONDS", "60"))
-DAILY_CAP      = int(os.getenv("DAILY_SEND_CAP", "200"))   # Gmail free allows ~500/day
-MAX_RETRIES    = int(os.getenv("MAX_RETRIES", "3"))
-DRAFT_WORKERS  = int(os.getenv("DRAFT_WORKERS", "3"))      # parallel drafting threads
+DELAY_MIN    = int(os.getenv("DELAY_MIN_SECONDS", "30"))
+DELAY_MAX    = int(os.getenv("DELAY_MAX_SECONDS", "60"))
+DAILY_CAP    = int(os.getenv("DAILY_SEND_CAP", "200"))
+MAX_RETRIES  = int(os.getenv("MAX_RETRIES", "3"))
+DRAFT_WORKERS = int(os.getenv("DRAFT_WORKERS", "3"))
 
-# Status column values
-STATUS_EMPTY      = ""
 STATUS_SENT_ONCE  = "email sent"
 STATUS_SENT_TWICE = "sent twice"
 STATUS_FAILED     = "failed"
-STATUS_SKIPPED    = "skipped"
 STATUS_REPLIED    = "replied"
 
 NO_ATTACHMENT_VALUES = {"", "na", "n/a", "none", "no", "nan", "-"}
@@ -91,13 +91,13 @@ log = logging.getLogger(__name__)
 def load_context():
     p = Path(CONTEXT_FILE)
     if not p.exists():
-        log.error(f"Context file '{CONTEXT_FILE}' not found. Create one (see README).")
+        log.error(f"'{CONTEXT_FILE}' not found. Create it first (see README).")
         return None
     return p.read_text(encoding="utf-8").strip()
 
 
-def list_attachments(folder):
-    p = Path(folder)
+def list_attachments():
+    p = Path(ATTACHMENTS_DIR)
     return [f.name for f in p.iterdir() if f.is_file()] if p.exists() else []
 
 
@@ -105,27 +105,21 @@ def is_valid_email(email):
     return bool(EMAIL_REGEX.match(email.strip()))
 
 
-def needs_no_attachment(file_hint):
-    return file_hint.lower().strip() in NO_ATTACHMENT_VALUES
+def needs_no_attachment(hint):
+    return hint.lower().strip() in NO_ATTACHMENT_VALUES
 
 
 def next_status(current):
-    """Decide what status to set on success based on current value."""
-    current = (current or "").lower().strip()
-    if current == "":
-        return STATUS_SENT_ONCE
-    if current == STATUS_SENT_ONCE:
-        return STATUS_SENT_TWICE
-    return current  # shouldn't happen — we skip these earlier
+    s = (current or "").lower().strip()
+    return STATUS_SENT_TWICE if s == STATUS_SENT_ONCE else STATUS_SENT_ONCE
 
 
 def should_skip(current_status):
-    """Returns (skip: bool, reason: str)."""
     s = (current_status or "").lower().strip()
     if s == STATUS_SENT_TWICE:
-        return True, "Already sent twice — skipping"
+        return True, "Already sent twice"
     if s == STATUS_REPLIED:
-        return True, "Recipient already replied — skipping"
+        return True, "Already replied"
     return False, ""
 
 
@@ -142,7 +136,8 @@ Available files:
 
 The contact needs: "{hint}"
 
-Reply with ONLY the exact filename from the list, or 'null' if nothing matches."""
+Reply with ONLY the exact filename, or 'null' if nothing matches."""
+
     try:
         r = ollama.chat(
             model=MODEL,
@@ -156,22 +151,19 @@ Reply with ONLY the exact filename from the list, or 'null' if nothing matches."
         return None
 
 
-def draft_email(context, name, description, attached_file, attempt_type="first"):
-    """attempt_type: 'first' = initial outreach, 'followup' = second attempt."""
+def draft_email_ai(context, name, description, attached_file, attempt_type):
     attachment_note = (
         f"\nAttachment: '{attached_file}' — reference it naturally."
         if attached_file else
         "\nAttachment: None — do not mention any attachment."
     )
-
     followup_note = ""
     if attempt_type == "followup":
         followup_note = """
 === THIS IS A FOLLOW-UP ===
-You previously sent an email to this person that didn't get a reply.
-Write a polite, brief follow-up email — NOT a copy of the first message.
-Acknowledge that you reached out before, keep it short (2-3 sentences),
-and gently re-state the ask. Do not be pushy."""
+Write a short, polite follow-up (2-3 sentences).
+Acknowledge you reached out before. Don't be pushy.
+Do NOT copy the first email."""
 
     prompt = f"""You are writing an email on behalf of {SENDER_NAME}.
 
@@ -180,14 +172,14 @@ and gently re-state the ask. Do not be pushy."""
 
 === RECIPIENT ===
 Name: {name}
-Specific details: {description}
+Details: {description}
 {attachment_note}
 {followup_note}
 
 Sign off with: {SENDER_NAME}
 
-Reply with JSON only, no markdown:
-{{"subject": "...", "body": "...with \\n for line breaks"}}"""
+Reply with JSON only — no markdown, no extra text:
+{{"subject": "subject line here", "body": "email body here with \\n for line breaks"}}"""
 
     r = ollama.chat(
         model=MODEL,
@@ -195,7 +187,6 @@ Reply with JSON only, no markdown:
         options={"temperature": 0.5}
     )
     text = re.sub(r"```json|```", "", r["message"]["content"]).strip()
-
     try:
         parsed = json.loads(text)
         return parsed.get("subject", "Following up"), parsed.get("body", text)
@@ -203,77 +194,81 @@ Reply with JSON only, no markdown:
         return "Following up", text
 
 
-# ── Send + retry ──────────────────────────────────────────────────────────────
+# ── Drafts file I/O ────────────────────────────────────────────────────────────
+#
+# drafts.json structure:
+# [
+#   {
+#     "email":          "priya@stripe.com",
+#     "name":           "Priya Sharma",
+#     "attempt_type":   "first",
+#     "matched_file":   "resume_2024.pdf",
+#     "attachment_path": "attachments/resume_2024.pdf",
+#     "subject":        "Your subject here",    ← YOU EDIT THESE
+#     "body":           "Your body here",       ← YOU EDIT THESE
+#     "row_idx":        2,
+#     "file_hint":      "resume"
+#   },
+#   ...
+# ]
+#
+# To edit: open drafts.json in any text editor, change "subject" and "body"
+# fields. Save. Then run --test or --send.
 
-def send_email_with_retry(to_email, subject, body, attachment_path):
-    last_err = None
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            msg = MIMEMultipart()
-            msg["From"]    = f"{SENDER_NAME} <{GMAIL_USER}>"
-            msg["To"]      = to_email
-            msg["Subject"] = subject
-            msg.attach(MIMEText(body, "plain", "utf-8"))
-
-            if attachment_path:
-                path = Path(attachment_path)
-                with open(path, "rb") as f:
-                    part = MIMEBase("application", "octet-stream")
-                    part.set_payload(f.read())
-                encoders.encode_base64(part)
-                part.add_header("Content-Disposition", f'attachment; filename="{path.name}"')
-                msg.attach(part)
-
-            with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-                server.login(GMAIL_USER, GMAIL_APP_PASS)
-                server.sendmail(GMAIL_USER, to_email, msg.as_string())
-            return True, None
-        except smtplib.SMTPException as e:
-            last_err = str(e)
-            # Throttling — pause longer and stop retrying further
-            if any(code in last_err for code in ["421", "454", "550"]):
-                log.warning(f"   ⏸  Gmail throttling detected: {last_err}")
-                return False, f"Gmail throttling: {last_err}"
-            backoff = 2 ** attempt
-            log.warning(f"   ↻  Retry {attempt}/{MAX_RETRIES} in {backoff}s — {last_err}")
-            time.sleep(backoff)
-        except Exception as e:
-            last_err = str(e)
-            backoff = 2 ** attempt
-            log.warning(f"   ↻  Retry {attempt}/{MAX_RETRIES} in {backoff}s — {last_err}")
-            time.sleep(backoff)
-    return False, last_err or "Unknown error"
-
-
-# ── Reply tracking ────────────────────────────────────────────────────────────
-
-def check_replies(contact_emails):
-    """Check Gmail inbox for replies from anyone in our contact list."""
-    log.info("Checking Gmail inbox for replies…")
-    replied = set()
-    try:
-        with imaplib.IMAP4_SSL("imap.gmail.com") as mail:
-            mail.login(GMAIL_USER, GMAIL_APP_PASS)
-            mail.select("INBOX")
-
-            for email_addr in contact_emails:
-                # Search for emails FROM this contact in the last 30 days
-                date_since = (datetime.now() - timedelta(days=30)).strftime("%d-%b-%Y")
-                status, data = mail.search(None, f'(FROM "{email_addr}" SINCE {date_since})')
-                if status == "OK" and data[0]:
-                    replied.add(email_addr.lower())
-    except Exception as e:
-        log.warning(f"Could not check replies via IMAP: {e}")
-        log.warning("Make sure IMAP is enabled in Gmail settings.")
-        return set()
-    log.info(f"Found {len(replied)} replies")
-    return replied
+def save_drafts(drafts):
+    """Save drafts to JSON — machine-readable, human-editable."""
+    # Strip attachment_path from what we save (it gets re-resolved on send)
+    clean = []
+    for d in drafts:
+        clean.append({
+            "email":           d["email"],
+            "name":            d["name"],
+            "attempt_type":    d["attempt_type"],
+            "matched_file":    d.get("matched_file") or "",
+            "attachment_path": d.get("attachment_path") or "",
+            "subject":         d["subject"],
+            "body":            d["body"],
+            "row_idx":         d["_row_idx"],
+            "file_hint":       d.get("file_hint", ""),
+            "current_status":  d.get("status", ""),
+        })
+    with open(DRAFTS_FILE, "w", encoding="utf-8") as f:
+        json.dump(clean, f, indent=2, ensure_ascii=False)
+    log.info(f"✓ Saved {len(clean)} drafts to '{DRAFTS_FILE}'")
 
 
-# ── Excel I/O ────────────────────────────────────────────────────────────────
+def load_drafts():
+    """Load drafts from JSON — includes any edits you made."""
+    if not Path(DRAFTS_FILE).exists():
+        log.error(f"'{DRAFTS_FILE}' not found. Run --draft first.")
+        return None
+    with open(DRAFTS_FILE, "r", encoding="utf-8") as f:
+        drafts = json.load(f)
+    log.info(f"✓ Loaded {len(drafts)} drafts from '{DRAFTS_FILE}'")
+    return drafts
+
+
+def write_preview(drafts):
+    """Write a human-readable .txt preview from the current drafts.json state."""
+    with open(PREVIEW_FILE, "w", encoding="utf-8") as f:
+        f.write(f"EMAIL PREVIEW — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write("Edit drafts.json to change any email. This file is regenerated automatically.\n")
+        f.write("=" * 70 + "\n\n")
+        for d in drafts:
+            f.write(f"To:      {d['name']} <{d['email']}>\n")
+            f.write(f"Type:    {d['attempt_type']}\n")
+            f.write(f"Attach:  {d.get('matched_file') or '(none)'}\n")
+            f.write(f"Subject: {d['subject']}\n")
+            f.write("-" * 70 + "\n")
+            body = d["body"].replace("\\n", "\n")
+            f.write(body + "\n")
+            f.write("=" * 70 + "\n\n")
+    log.info(f"✓ Human-readable preview saved to '{PREVIEW_FILE}'")
+
+
+# ── Excel I/O ─────────────────────────────────────────────────────────────────
 
 def read_contacts():
-    """Read xlsx with openpyxl so we can also write back to it."""
     wb = load_workbook(EXCEL_FILE)
     ws = wb.active
     headers = [str(c.value).lower().strip() if c.value else "" for c in ws[1]]
@@ -286,7 +281,6 @@ def read_contacts():
                 data[headers[i]] = str(cell.value).strip() if cell.value is not None else ""
         data["_row_idx"] = row_idx
         contacts.append(data)
-
     return wb, ws, headers, contacts
 
 
@@ -310,92 +304,118 @@ def update_status(wb, ws, row_idx, status_col, value):
 def init_log():
     if not Path(LOG_FILE).exists():
         with open(LOG_FILE, "w", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerow(["timestamp", "name", "email", "attempt_type", "file_hint", "matched_file", "subject", "status", "note"])
+            csv.writer(f).writerow([
+                "timestamp", "name", "email", "attempt_type",
+                "matched_file", "subject", "status", "note"
+            ])
 
 
-def write_log(row):
+def write_log(entry):
     with open(LOG_FILE, "a", newline="", encoding="utf-8") as f:
-        csv.DictWriter(f, fieldnames=["timestamp", "name", "email", "attempt_type", "file_hint", "matched_file", "subject", "status", "note"]).writerow(row)
+        csv.DictWriter(f, fieldnames=[
+            "timestamp", "name", "email", "attempt_type",
+            "matched_file", "subject", "status", "note"
+        ]).writerow(entry)
 
 
-# ── Pretty terminal helpers ───────────────────────────────────────────────────
+# ── SMTP send ─────────────────────────────────────────────────────────────────
+
+def send_email_with_retry(to_email, subject, body, attachment_path):
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            msg = MIMEMultipart()
+            msg["From"]    = f"{SENDER_NAME} <{GMAIL_USER}>"
+            msg["To"]      = to_email
+            msg["Subject"] = subject
+            msg.attach(MIMEText(body.replace("\\n", "\n"), "plain", "utf-8"))
+
+            if attachment_path and Path(attachment_path).exists():
+                path = Path(attachment_path)
+                with open(path, "rb") as f:
+                    part = MIMEBase("application", "octet-stream")
+                    part.set_payload(f.read())
+                encoders.encode_base64(part)
+                part.add_header("Content-Disposition", f'attachment; filename="{path.name}"')
+                msg.attach(part)
+
+            with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+                server.login(GMAIL_USER, GMAIL_APP_PASS)
+                server.sendmail(GMAIL_USER, to_email, msg.as_string())
+            return True, None
+
+        except smtplib.SMTPException as e:
+            err = str(e)
+            if any(code in err for code in ["421", "454", "550"]):
+                return False, f"Gmail throttling: {err}"
+            backoff = 2 ** attempt
+            log.warning(f"   ↻ Retry {attempt}/{MAX_RETRIES} in {backoff}s — {err}")
+            time.sleep(backoff)
+        except Exception as e:
+            backoff = 2 ** attempt
+            log.warning(f"   ↻ Retry {attempt}/{MAX_RETRIES} in {backoff}s — {e}")
+            time.sleep(backoff)
+    return False, "Max retries exceeded"
+
+
+# ── IMAP reply check ──────────────────────────────────────────────────────────
+
+def check_replies(contact_emails):
+    log.info("Checking Gmail for replies…")
+    replied = set()
+    try:
+        with imaplib.IMAP4_SSL("imap.gmail.com") as mail:
+            mail.login(GMAIL_USER, GMAIL_APP_PASS)
+            mail.select('"[Gmail]/All Mail"')
+            date_since = (datetime.now() - timedelta(days=30)).strftime("%d-%b-%Y")
+            for addr in contact_emails:
+                status, data = mail.search(None, f'(FROM "{addr}" SINCE {date_since})')
+                if status == "OK" and data[0]:
+                    replied.add(addr.lower())
+    except Exception as e:
+        log.warning(f"IMAP check failed: {e}")
+        return set()
+    log.info(f"Found {len(replied)} replies")
+    return replied
+
+
+# ── Countdown timer ───────────────────────────────────────────────────────────
 
 def countdown_delay(seconds):
     for r in range(seconds, 0, -1):
-        print(f"\r   ⏳ Waiting {r}s before next send... ", end="", flush=True)
+        print(f"\r   ⏳ Next email in {r}s... ", end="", flush=True)
         time.sleep(1)
-    print("\r" + " " * 60 + "\r", end="", flush=True)
+    print("\r" + " " * 50 + "\r", end="", flush=True)
 
 
-def write_drafts_preview(drafts):
-    with open(DRAFTS_FILE, "w", encoding="utf-8") as f:
-        f.write(f"DRAFTS PREVIEW — generated {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write("=" * 70 + "\n\n")
-        for d in drafts:
-            f.write(f"To:      {d['name']} <{d['email']}>\n")
-            f.write(f"Type:    {d['attempt_type']}\n")
-            f.write(f"Attach:  {d.get('matched_file') or '(none)'}\n")
-            f.write(f"Subject: {d['subject']}\n")
-            f.write("-" * 70 + "\n")
-            f.write(d["body"] + "\n")
-            f.write("=" * 70 + "\n\n")
-    log.info(f"✓ Wrote {len(drafts)} drafts to '{DRAFTS_FILE}' for your review")
+# ── Mode handlers ─────────────────────────────────────────────────────────────
 
-
-# ── Main ───────────────────────────────────────────────────────────────────────
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dry-run",       action="store_true", help="Draft emails but don't send them")
-    parser.add_argument("--test",          action="store_true", help="Send all emails to TEST_EMAIL instead")
-    parser.add_argument("--check-replies", action="store_true", help="Only check for replies, don't send")
-    args = parser.parse_args()
-
+def run_draft():
+    """
+    --draft mode
+    Runs AI on every eligible contact, saves results to drafts.json
+    and a human-readable drafts_preview.txt.
+    You edit drafts.json before running --test or --send.
+    """
+    log.info("MODE: DRAFT — AI will generate emails and save to drafts.json")
+    log.info("After this, edit drafts.json then run --test or --send")
     log.info("=" * 60)
-    log.info("AI Email Sender v3 — Production Edition")
-    if args.dry_run:       log.info("MODE: DRY RUN (no emails will be sent)")
-    if args.test:          log.info(f"MODE: TEST (all emails redirected to {TEST_EMAIL})")
-    if args.check_replies: log.info("MODE: REPLY CHECK ONLY")
-    log.info("=" * 60)
-
-    # Validate
-    if not GMAIL_USER or not GMAIL_APP_PASS:
-        log.error("Missing GMAIL_USER or GMAIL_APP_PASSWORD in .env")
-        return
-    if args.test and not TEST_EMAIL:
-        log.error("--test mode needs TEST_EMAIL in .env")
-        return
 
     context = load_context()
     if not context:
         return
-    log.info(f"✓ Loaded context.md ({len(context)} chars)")
 
-    # Read spreadsheet
     try:
         wb, ws, headers, all_contacts = read_contacts()
     except FileNotFoundError:
-        log.error(f"Excel file '{EXCEL_FILE}' not found")
+        log.error(f"'{EXCEL_FILE}' not found")
         return
 
     status_col = ensure_status_column(wb, ws, headers)
-    log.info(f"✓ Loaded {len(all_contacts)} rows from '{EXCEL_FILE}'")
+    available_files = list_attachments()
 
-    # Reply check mode — just update status of repliers and exit
-    if args.check_replies:
-        all_emails = [c.get("email", "") for c in all_contacts if c.get("email")]
-        replied = check_replies(all_emails)
-        if replied:
-            for c in all_contacts:
-                if c.get("email", "").lower() in replied:
-                    update_status(wb, ws, c["_row_idx"], status_col, STATUS_REPLIED)
-                    log.info(f"   ↩ {c.get('name')} replied")
-        log.info("=" * 60)
-        return
-
-    # Dedup + validation
+    # Filter eligible contacts
     seen = set()
-    contacts = []
+    to_draft = []
     for c in all_contacts:
         email = c.get("email", "").strip().lower()
         if not email or email == "nan":
@@ -404,176 +424,271 @@ def main():
             log.warning(f"⚠ Invalid email skipped: {c.get('email')}")
             continue
         if email in seen:
-            log.warning(f"⚠ Duplicate email skipped: {email}")
+            log.warning(f"⚠ Duplicate skipped: {email}")
             continue
         seen.add(email)
-        contacts.append(c)
-
-    # Filter to only contacts that need sending
-    to_process = []
-    for c in contacts:
-        status = c.get("status", "")
-        skip, reason = should_skip(status)
+        skip, reason = should_skip(c.get("status", ""))
         if skip:
-            log.info(f"   ⊘ {c['email']} — {reason}")
+            log.info(f"   ⊘ {email} — {reason}")
             continue
-        to_process.append(c)
+        to_draft.append(c)
 
-    if not to_process:
-        log.info("No contacts need processing. Done.")
+    if not to_draft:
+        log.info("No contacts need drafting.")
         return
 
-    log.info(f"✓ {len(to_process)} contacts to process this run")
-
-    # Optional: check for replies first so we don't email people who already replied
-    if not args.dry_run and not args.test:
-        try:
-            replied = check_replies([c["email"] for c in to_process])
-            new_to_process = []
-            for c in to_process:
-                if c["email"].lower() in replied:
-                    update_status(wb, ws, c["_row_idx"], status_col, STATUS_REPLIED)
-                    log.info(f"   ↩ {c['name']} already replied — skipping")
-                else:
-                    new_to_process.append(c)
-            to_process = new_to_process
-        except Exception as e:
-            log.warning(f"Reply check skipped: {e}")
-
-    available_files = list_attachments(ATTACHMENTS_DIR)
-    log.info(f"✓ {len(available_files)} files in '{ATTACHMENTS_DIR}/'")
-    log.info("=" * 60)
-
-    # ── STAGE 1: Pre-draft ALL emails in parallel ───────────────────────────────
-    log.info("Stage 1: Pre-drafting all emails in parallel…")
+    log.info(f"Drafting {len(to_draft)} emails using {MODEL}…")
 
     def make_draft(c):
         try:
-            status = c.get("status", "")
+            status       = c.get("status", "")
             attempt_type = "followup" if status.lower() == STATUS_SENT_ONCE else "first"
-            file_hint = c.get("file_hint", "") or c.get("file", "")
-
+            file_hint    = c.get("file_hint", "") or c.get("file", "")
             matched_file    = None
             attachment_path = None
-            if not needs_no_attachment(file_hint):
-                if available_files:
-                    matched_file = match_file(file_hint, available_files)
-                    if matched_file:
-                        attachment_path = str(Path(ATTACHMENTS_DIR) / matched_file)
 
-            subject, body = draft_email(
+            if not needs_no_attachment(file_hint) and available_files:
+                matched_file = match_file(file_hint, available_files)
+                if matched_file:
+                    attachment_path = str(Path(ATTACHMENTS_DIR) / matched_file)
+
+            subject, body = draft_email_ai(
                 context, c.get("name", "there"),
                 c.get("description", ""), matched_file, attempt_type
             )
-            return {
-                **c,
-                "attempt_type":    attempt_type,
-                "matched_file":    matched_file,
-                "attachment_path": attachment_path,
-                "subject":         subject,
-                "body":            body,
-                "draft_ok":        True,
-            }
+            return {**c, "attempt_type": attempt_type, "matched_file": matched_file,
+                    "attachment_path": attachment_path, "subject": subject,
+                    "body": body, "draft_ok": True}
         except Exception as e:
-            return {**c, "draft_ok": False, "error": str(e)}
+            return {**c, "draft_ok": False, "draft_error": str(e)}
 
     drafts = []
-    init_log()
     with ThreadPoolExecutor(max_workers=DRAFT_WORKERS) as executor:
-        futures = {executor.submit(make_draft, c): c for c in to_process}
+        futures = {executor.submit(make_draft, c): c for c in to_draft}
         for i, fut in enumerate(as_completed(futures), start=1):
             d = fut.result()
-            drafts.append(d)
-            if d["draft_ok"]:
-                tag = "📎" if d["matched_file"] else "📭"
-                log.info(f"   [{i}/{len(to_process)}] {tag} Drafted for {d['name']}: \"{d['subject']}\"")
+            if d.get("draft_ok"):
+                tag = "📎" if d.get("matched_file") else "📭"
+                log.info(f"   [{i}/{len(to_draft)}] {tag} {d['name']} — \"{d['subject']}\"")
             else:
-                log.error(f"   [{i}/{len(to_process)}] ✗ Draft failed for {d['name']}: {d['error']}")
+                log.error(f"   [{i}/{len(to_draft)}] ✗ {d.get('name')} — {d.get('draft_error')}")
+            drafts.append(d)
 
-    # Restore original order from to_process
-    order = {c["email"]: idx for idx, c in enumerate(to_process)}
-    drafts.sort(key=lambda d: order.get(d.get("email", ""), 999999))
+    # Restore original sheet order
+    order = {c["email"].lower(): idx for idx, c in enumerate(to_draft)}
+    drafts.sort(key=lambda d: order.get(d.get("email", "").lower(), 9999))
 
-    successful_drafts = [d for d in drafts if d.get("draft_ok")]
-    write_drafts_preview(successful_drafts)
+    good = [d for d in drafts if d.get("draft_ok")]
 
-    # ── Dry run — stop here ─────────────────────────────────────────────────────
-    if args.dry_run:
-        log.info("=" * 60)
-        log.info(f"DRY RUN COMPLETE — {len(successful_drafts)} drafts in '{DRAFTS_FILE}'")
-        log.info("Review the file, then run without --dry-run to send.")
-        log.info("=" * 60)
+    if not good:
+        log.error("All drafts failed. Check Ollama is running.")
         return
 
-    # ── STAGE 2: Send sequentially with delays ──────────────────────────────────
+    save_drafts(good)
+    write_preview(good)
+
     log.info("=" * 60)
-    log.info(f"Stage 2: Sending {len(successful_drafts)} emails with {DELAY_MIN}-{DELAY_MAX}s delays…")
-    log.info(f"Daily cap: {DAILY_CAP} emails. Will pause when reached.")
+    log.info(f"Done. {len(good)} drafts saved.")
+    log.info(f"")
+    log.info(f"  → Open 'drafts.json' and edit any subject or body you want")
+    log.info(f"  → Open 'drafts_preview.txt' for easy reading")
+    log.info(f"  → Then run:  python send_emails.py --test")
+    log.info(f"  → Then run:  python send_emails.py --send")
     log.info("=" * 60)
 
-    stats = {"sent": 0, "skipped": 0, "failed": 0, "replied": 0}
+
+def run_send(test_mode=False):
+    """
+    --test and --send mode
+    Both read from drafts.json (your edited version).
+    --test  sends to TEST_EMAIL, does not update Excel status
+    --send  sends to real recipients, updates Excel status
+    """
+    mode_label = "TEST (sending to yourself)" if test_mode else "SEND (sending to real recipients)"
+    log.info(f"MODE: {mode_label}")
+    log.info("Reading from drafts.json — your edits are respected")
+    log.info("=" * 60)
+
+    if not GMAIL_USER or not GMAIL_APP_PASS:
+        log.error("Missing GMAIL_USER or GMAIL_APP_PASSWORD in .env")
+        return
+
+    if test_mode and not TEST_EMAIL:
+        log.error("--test mode needs TEST_EMAIL set in .env")
+        return
+
+    drafts = load_drafts()
+    if not drafts:
+        return
+
+    # For --send, load Excel to update status
+    wb = ws = status_col = None
+    if not test_mode:
+        try:
+            wb, ws, headers, _ = read_contacts()
+            status_col = ensure_status_column(wb, ws, headers)
+        except FileNotFoundError:
+            log.error(f"'{EXCEL_FILE}' not found")
+            return
+
+    # For --send, check replies first so we skip people who already wrote back
+    if not test_mode:
+        try:
+            replied = check_replies([d["email"] for d in drafts])
+            if replied:
+                remaining = []
+                for d in drafts:
+                    if d["email"].lower() in replied:
+                        log.info(f"   ↩ {d['name']} already replied — skipping")
+                        update_status(wb, ws, d["row_idx"], status_col, STATUS_REPLIED)
+                    else:
+                        remaining.append(d)
+                drafts = remaining
+        except Exception as e:
+            log.warning(f"Reply check skipped: {e}")
+
+    if not drafts:
+        log.info("No emails to send after reply check.")
+        return
+
+    init_log()
+    stats  = {"sent": 0, "failed": 0}
     sent_today = 0
 
-    for idx, d in enumerate(successful_drafts):
-        if sent_today >= DAILY_CAP:
-            log.warning(f"⏸  Daily cap of {DAILY_CAP} reached. Stopping for today.")
-            log.warning("    Re-run tomorrow to continue (status column tracks progress).")
+    log.info(f"Sending {len(drafts)} emails…")
+    if not test_mode:
+        log.info(f"Delays: {DELAY_MIN}-{DELAY_MAX}s | Daily cap: {DAILY_CAP}")
+    log.info("=" * 60)
+
+    for idx, d in enumerate(drafts):
+        if not test_mode and sent_today >= DAILY_CAP:
+            log.warning(f"Daily cap of {DAILY_CAP} reached. Run again tomorrow.")
             break
 
-        target_email = TEST_EMAIL if args.test else d["email"]
-        log.info(f"[{idx+1}/{len(successful_drafts)}] → {d['name']} <{target_email}>")
-        if args.test:
-            log.info(f"   (originally: {d['email']})")
+        target = TEST_EMAIL if test_mode else d["email"]
+        log.info(f"[{idx+1}/{len(drafts)}] → {d['name']} <{target}>")
+        if test_mode:
+            log.info(f"   (real recipient: {d['email']})")
+
+        attachment_path = d.get("attachment_path") or None
+
+        success, err = send_email_with_retry(
+            target, d["subject"], d["body"], attachment_path
+        )
 
         log_entry = {
             "timestamp":    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "name":         d["name"],
             "email":        d["email"],
             "attempt_type": d["attempt_type"],
-            "file_hint":    d.get("file_hint", ""),
             "matched_file": d.get("matched_file") or "",
             "subject":      d["subject"],
             "status":       "",
             "note":         "",
         }
 
-        success, err = send_email_with_retry(
-            target_email, d["subject"], d["body"], d.get("attachment_path")
-        )
-
         if success:
-            log.info(f"   ✓ Sent — {d['subject']}")
+            log.info(f"   ✓ Sent — \"{d['subject']}\"")
             log_entry["status"] = "SENT"
             stats["sent"] += 1
             sent_today += 1
-            if not args.test:
-                # Update Excel status column only on real sends
-                new_status = next_status(d.get("status", ""))
-                update_status(wb, ws, d["_row_idx"], status_col, new_status)
+            if not test_mode:
+                new_status = next_status(d.get("current_status", ""))
+                update_status(wb, ws, d["row_idx"], status_col, new_status)
         else:
             log.error(f"   ✗ Failed: {err}")
             log_entry["status"] = "FAILED"
             log_entry["note"]   = err
             stats["failed"] += 1
-            if not args.test:
-                update_status(wb, ws, d["_row_idx"], status_col, STATUS_FAILED)
-            # If Gmail is throttling, stop the whole run
+            if not test_mode:
+                update_status(wb, ws, d["row_idx"], status_col, STATUS_FAILED)
             if err and any(x in err for x in ["throttling", "421", "454"]):
-                log.error("Gmail is rate-limiting. Stopping run to protect your account.")
+                log.error("Gmail throttling detected — stopping.")
+                write_log(log_entry)
                 break
 
         write_log(log_entry)
 
-        if idx < len(successful_drafts) - 1 and sent_today < DAILY_CAP:
+        if idx < len(drafts) - 1 and (not test_mode) and sent_today < DAILY_CAP:
             countdown_delay(random.randint(DELAY_MIN, DELAY_MAX))
 
-    # Summary
     log.info("=" * 60)
-    log.info(f"Done. Sent: {stats['sent']}  Failed: {stats['failed']}  Today's total: {sent_today}/{DAILY_CAP}")
-    log.info(f"Log:    '{LOG_FILE}'")
-    log.info(f"Drafts: '{DRAFTS_FILE}'")
-    log.info(f"Excel status column updated.")
+    log.info(f"Done. Sent: {stats['sent']}  Failed: {stats['failed']}")
+    if not test_mode:
+        log.info("Excel status column updated.")
+    log.info(f"Log: '{LOG_FILE}'")
     log.info("=" * 60)
+
+
+def run_check_replies():
+    """--check-replies mode: scan inbox and update Excel."""
+    log.info("MODE: CHECK REPLIES")
+    log.info("=" * 60)
+
+    try:
+        wb, ws, headers, contacts = read_contacts()
+        status_col = ensure_status_column(wb, ws, headers)
+    except FileNotFoundError:
+        log.error(f"'{EXCEL_FILE}' not found")
+        return
+
+    emails = [c.get("email", "") for c in contacts if c.get("email")]
+    replied = check_replies(emails)
+
+    for c in contacts:
+        if c.get("email", "").lower() in replied:
+            update_status(wb, ws, c["_row_idx"], status_col, STATUS_REPLIED)
+            log.info(f"   ↩ Marked as replied: {c.get('name')} <{c.get('email')}>")
+
+    log.info("=" * 60)
+    log.info("Done. Excel updated.")
+    log.info("=" * 60)
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="AI Email Sender — Draft → Edit → Send",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Workflow:
+  1. python send_emails.py --draft          # AI generates, saves drafts.json
+  2. Edit drafts.json (change subject/body)
+  3. python send_emails.py --test           # sends your edits to TEST_EMAIL
+  4. python send_emails.py --send           # sends your edits to real recipients
+  5. python send_emails.py --check-replies  # scan inbox, update Excel
+        """
+    )
+    parser.add_argument("--draft",         action="store_true", help="Generate drafts with AI and save to drafts.json")
+    parser.add_argument("--test",          action="store_true", help="Send drafts.json to TEST_EMAIL for review")
+    parser.add_argument("--send",          action="store_true", help="Send drafts.json to real recipients")
+    parser.add_argument("--check-replies", action="store_true", help="Scan inbox for replies and update Excel")
+
+    args = parser.parse_args()
+
+    # Enforce exactly one mode
+    modes = [args.draft, args.test, args.send, args.check_replies]
+    if sum(modes) == 0:
+        parser.print_help()
+        print("\n⚠ Specify a mode: --draft, --test, --send, or --check-replies")
+        sys.exit(1)
+    if sum(modes) > 1:
+        print("⚠ Only one mode at a time please.")
+        sys.exit(1)
+
+    log.info("=" * 60)
+    log.info("AI Email Sender v4")
+    log.info("=" * 60)
+
+    if args.draft:
+        run_draft()
+    elif args.test:
+        run_send(test_mode=True)
+    elif args.send:
+        run_send(test_mode=False)
+    elif args.check_replies:
+        run_check_replies()
 
 
 if __name__ == "__main__":
