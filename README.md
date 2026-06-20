@@ -1,4 +1,4 @@
-# AI Email Sender — Local, Free, Context-Driven Bulk Email Tool
+# AI Email Sender v3 — Production-Grade Bulk Email Tool
 
 Send personalised bulk emails using AI — for job applications, event invites, follow-ups, sales outreach, or any campaign where every email needs to feel personally written.
 
@@ -6,54 +6,71 @@ Runs entirely on your computer using **Phi-4 Mini** (a free local AI model) and 
 
 ---
 
-## What this does
+## What's new in v3
 
-You provide:
-1. A shared **context.md** file — what the campaign is about, your tone, what to include in every email
-2. A **contacts.xlsx** spreadsheet — one row per recipient, with name + email + specific details
-3. Optional **attachment files** — resumes, brochures, invoices, etc.
-
-The tool:
-- Reads each row from your spreadsheet
-- Combines your shared context with the per-row description
-- Drafts a unique, personalised email using AI
-- Attaches the right file based on a keyword hint (or skips attachment if marked "NA")
-- Sends via your Gmail with a random delay between sends to avoid spam filters
-- Logs every result to a CSV so you can track what was sent
-
----
-
-## Why use this instead of a normal mail merge?
-
-A normal mail merge replaces placeholders like `{name}` and `{company}` with values from a sheet — every email has the same wording, just different names. That's exactly what spam filters and hiring managers learn to spot.
-
-This tool actually **writes** each email from scratch using your context and a short description. Two emails from the same campaign will read like two genuinely different messages — different opening sentences, different phrasing, different structures — because the AI generates each one independently.
+| Feature | What it does |
+|---|---|
+| **Status column tracking** | Excel sheet tracks who's been emailed — never accidentally send twice |
+| **Resume from crash** | Stop the script anytime — re-running picks up exactly where it left off |
+| **Dry-run mode** | Preview every email before sending with `--dry-run` |
+| **Test recipient override** | Send all emails to yourself with `--test` for full QA |
+| **Email validation** | Catches typos like `john@gmial.com` before sending |
+| **Duplicate detection** | Same email twice in the sheet = sent only once |
+| **Daily send cap** | Auto-stops at 200/day (configurable) to protect your Gmail reputation |
+| **Retry with backoff** | Transient SMTP errors retried 3 times with exponential backoff |
+| **Reply tracking** | Checks Gmail inbox — skips contacts who already replied |
+| **Parallel drafting** | All emails drafted at once (3x faster), then sent with delays |
 
 ---
 
-## Perfect for
+## How the status column works
 
-- **Job applications** — send personalised outreach to recruiters with your resume attached
-- **Event invites** — tailor invites for each guest based on what you know about them
-- **Wishing emails** — birthdays, anniversaries, holidays, congratulations
-- **Sales outreach** — follow up on leads with context-aware messages
-- **Networking** — reach out to multiple people with genuinely different emails
-- **Course / community announcements** — announce launches to mailing lists
+Add a `status` column to your `contacts.xlsx`. The script automatically updates it after each email:
+
+| Status value | Meaning | Next run action |
+|---|---|---|
+| *(empty)* | Never contacted | ✅ Send first email → mark as `email sent` |
+| `email sent` | Sent once | ✅ Send follow-up → mark as `sent twice` |
+| `sent twice` | Already followed up | ⛔ Skip — do not contact again |
+| `failed` | Last attempt failed | 🔁 Retry on next run |
+| `replied` | They replied to a previous email | ⛔ Skip — auto-set by reply tracker |
+
+If you don't add the status column yourself, the script adds it automatically on first run.
+
+**This gives you a built-in 2-email-max rule.** You can never accidentally spam someone — once they're at `sent twice`, the script will refuse to send them anything ever again.
 
 ---
 
-## Requirements
+## Running modes
 
-- **Python 3.9 or higher**
-- **Ollama** installed and running ([ollama.com](https://ollama.com))
-- **Phi-4 Mini** model pulled (~2.5 GB, runs on most laptops with 8GB RAM)
-- A **Gmail account** with 2-Step Verification enabled
+### Normal run (sends real emails)
+```bash
+python send_emails.py
+```
+
+### Dry-run — preview drafts, don't send
+```bash
+python send_emails.py --dry-run
+```
+Drafts every email and writes them to `drafts_preview.txt`. No emails are sent. Review the file, then run without the flag.
+
+### Test mode — send all to yourself
+```bash
+python send_emails.py --test
+```
+Sends every email to your `TEST_EMAIL` instead of real recipients. Perfect for confirming attachments, subjects, and formatting before a real run. Status column is NOT updated in test mode.
+
+### Check replies only
+```bash
+python send_emails.py --check-replies
+```
+Scans your Gmail inbox for replies from contacts in the sheet and updates their status to `replied`. Doesn't send anything.
 
 ---
 
 ## Setup (one time)
 
-### 1. Install Ollama and pull the model
+### 1. Install Ollama and pull Phi-4 Mini
 ```bash
 # Download from ollama.com, then:
 ollama pull phi4-mini
@@ -67,123 +84,114 @@ python -m pip install pandas openpyxl ollama python-dotenv --user
 ### 3. Get a Gmail App Password
 1. Go to **myaccount.google.com → Security**
 2. Enable **2-Step Verification**
-3. Search **"App Passwords"** → create one named "Email Sender"
-4. Copy the 16-character password
+3. Search **"App Passwords"** → create one → copy the 16-char password
 
-### 4. Set up your project folder
+### 4. Enable IMAP in Gmail (for reply tracking)
+1. Gmail → Settings → See all settings
+2. Forwarding and POP/IMAP tab
+3. Enable IMAP → Save changes
+
+### 5. Set up your folder
 ```
 email-sender/
-├── send_emails.py        ← the main script
-├── context.md            ← your campaign context (see below)
-├── contacts.xlsx         ← your spreadsheet
-├── attachments/          ← any files to attach
+├── send_emails.py        ← the script
+├── context.md            ← your campaign context
+├── contacts.xlsx         ← your spreadsheet (with status column)
+├── attachments/          ← files to attach
 │   ├── resume.pdf
-│   ├── portfolio.pdf
-│   └── brochure.pdf
-├── .env                  ← your Gmail credentials
-└── sent_log.csv          ← auto-created on first run
+│   └── portfolio.pdf
+├── .env                  ← your credentials
+├── sent_log.csv          ← auto-created
+└── drafts_preview.txt    ← auto-created when using --dry-run
 ```
 
-### 5. Create your .env file
+### 6. Create your .env file
+Copy `.env.example` to `.env` and fill in your values:
 ```env
 GMAIL_USER=your@gmail.com
-GMAIL_APP_PASSWORD=your-16-char-app-password
-SENDER_NAME=Your Full Name
+GMAIL_APP_PASSWORD=your-16-char-password
+SENDER_NAME=Your Name
+TEST_EMAIL=your@gmail.com
 
-# Optional — control how slow/fast emails send (in seconds)
 DELAY_MIN_SECONDS=30
 DELAY_MAX_SECONDS=60
+DAILY_SEND_CAP=200
+MAX_RETRIES=3
+DRAFT_WORKERS=3
 ```
 
 ---
 
-## How to use it
+## Excel sheet format
 
-### Step 1 — Edit `context.md`
-Tell the AI what your campaign is about. Be specific about tone, what every email should include, and what to avoid.
-
-See the included `context.md` for a job application example. Adapt it for your purpose.
-
-### Step 2 — Fill in `contacts.xlsx`
-Required columns (lowercase, exactly these names):
-
-| name | email | description | file_hint |
-|---|---|---|---|
-| Monkey Song | monkey@tripe.com | Backend Engineer role at Stripe — values distributed systems experience | resume |
-| Anna Filler | anna@techcorp.com | Following up on our LinkedIn chat about their platform team | NA |
+| name | email | description | file_hint | status |
+|---|---|---|---|---|
+| Priya Sharma | priya@stripe.com | Backend Engineer role at Stripe | resume | |
+| David Kim | david@startup.io | Senior SWE position at fintech startup | resume | email sent |
+| Anna Mueller | anna@techcorp.com | LinkedIn follow-up | NA | sent twice |
 
 - **name** — recipient's name
 - **email** — their email address
-- **description** — what makes THIS email different from the others (specific details, the role, the context)
-- **file_hint** — keyword to match a file in `/attachments` (e.g. "resume" → resume.pdf). Use **NA** or leave blank if no file needed.
+- **description** — specifics for this person (what makes this email different)
+- **file_hint** — keyword matching a file in `/attachments` (e.g. "resume" → resume.pdf). Use **NA** or leave empty for no attachment
+- **status** — leave empty for first send. Auto-updated by the script
 
-### Step 3 — Add your attachments
-Drop files into the `attachments/` folder. The AI matches them to each contact via the file_hint keyword.
+---
 
-### Step 4 — Run
+## Recommended workflow for job applications
+
 ```bash
+# Step 1 — Add 10 contacts to your sheet, leave status empty
+# Step 2 — Dry-run to preview drafts
+python send_emails.py --dry-run
+# Review drafts_preview.txt
+
+# Step 3 — Test by sending all to yourself
+python send_emails.py --test
+# Check your inbox — does formatting/attachment look right?
+
+# Step 4 — Real send
 python send_emails.py
+# Excel updates: all rows now say "email sent"
+
+# Step 5 — Wait 7 days, check for replies
+python send_emails.py --check-replies
+# Repliers get marked "replied" — they won't get follow-ups
+
+# Step 6 — Send follow-up to the rest
+python send_emails.py
+# Anyone still on "email sent" gets a polite follow-up
+# After this run, they're marked "sent twice" — no further emails ever
 ```
 
-The script will:
-- Validate your setup
-- Process each contact one by one
-- Show real-time progress with a countdown between emails
-- Save a full log to `sent_log.csv`
+---
+
+## Why XLSX (not CSV / ODS / JSON)?
+
+XLSX is the right choice for this tool:
+- Universal — opens in Excel, Google Sheets, Numbers, LibreOffice
+- Supports the status column workflow naturally (cell formatting, dropdowns)
+- The format itself is an open ISO standard (Office Open XML)
+- The library we use (`openpyxl`) is fully open source
+- The actual bottleneck is AI drafting and send delays — not the file format
+
+If you ever need a 100% open alternative, CSV works too — but you lose cell formatting and validation. Just rename to `.csv` and the script reads it the same way.
 
 ---
 
-## Anti-spam features built in
+## Anti-spam features explained
 
-| Feature | What it does |
+| Feature | Why it matters |
 |---|---|
-| **Random delays** | Waits 30–60 seconds between emails (configurable) so it doesn't look bot-like |
-| **Unique content per email** | AI generates fresh wording each time — no two emails are identical |
-| **Real Gmail SMTP** | Uses your actual Gmail server, not a third-party relay |
-| **Plain text body** | Avoids HTML which triggers more spam filters for cold outreach |
-| **Natural language** | AI writes like a person, no "Dear Sir/Madam" templates |
+| 30–60s randomised delay | Real humans don't send emails every 5 seconds |
+| Unique AI-generated content | Spam filters detect identical templates instantly |
+| Real Gmail SMTP | Sending from `gmail.com` has best deliverability |
+| Plain text only | HTML emails get more scrutiny from spam filters |
+| Daily cap (200) | Gmail's hard limit is ~500/day — staying under buffers safely |
+| App Password (not OAuth) | More stable for scripted sending |
+| Personal sign-off | AI always signs off with your real name |
 
-**Gmail free account limits**: ~500 emails/day. The tool will happily run through that, but stagger large batches across multiple days to stay safe.
-
----
-
-## Example use cases
-
-### Job applications
-**context.md** — explains your background, what kind of roles you want, your portfolio
-**description column** — the specific role and what to emphasize for that company
-**file_hint** — `resume` (matches resume.pdf in attachments)
-
-### Birthday wishes
-**context.md** — warm, personal tone, mention something genuine
-**description column** — what you remember about them, shared memory, or recent news
-**file_hint** — `NA` (no attachment needed)
-
-### Event invitations
-**context.md** — the event details, date, venue, dress code
-**description column** — why you want THIS person there, personal touch
-**file_hint** — `invite` (matches invitation.pdf)
-
-### Sales follow-ups
-**context.md** — your product, value proposition, what to mention
-**description column** — what was discussed in the last call, their pain point
-**file_hint** — `proposal` or `case_study` or `NA`
-
----
-
-## Reading the log file
-
-After every run, `sent_log.csv` shows:
-
-| column | meaning |
-|---|---|
-| timestamp | when the email was processed |
-| name, email | recipient |
-| file_hint | what the row asked for |
-| matched_file | what file was actually attached (if any) |
-| subject | the AI-generated subject line |
-| status | SENT / SKIPPED / FAILED |
-| note | reason if skipped or failed |
+**Realistic throughput**: At 30-60s delays, expect ~60-90 emails per hour. A 200-email daily cap means about 3 hours of script running.
 
 ---
 
@@ -191,33 +199,35 @@ After every run, `sent_log.csv` shows:
 
 | Problem | Fix |
 |---|---|
-| `Module not found: ollama` | Run `python -m pip install ollama --user` |
-| `App Passwords not available` | Enable 2-Step Verification first |
-| Emails going to spam | Increase `DELAY_MIN_SECONDS` to 60+, send fewer per day |
-| Email skipped — "no file matched" | Check filename in attachments matches the file_hint keyword |
-| Ollama connection refused | Make sure Ollama app is running (check system tray) |
-| Generic-sounding emails | Make your `description` column more specific |
+| `Module not found` | `python -m pip install <name> --user` |
+| Emails going to spam | Increase `DELAY_MIN_SECONDS` to 60+, send <100/day |
+| IMAP reply check fails | Enable IMAP in Gmail settings (Forwarding and POP/IMAP) |
+| Phi-4 Mini hangs | Make sure Ollama is running (system tray) — restart it if stuck |
+| Status column not updating | Close `contacts.xlsx` before running — file lock issue |
+| `Gmail throttling` warning | You hit Gmail's limit — stop and wait 24 hours |
 
 ---
 
-## Tips for best results
+## What to put in context.md
 
-1. **Be specific in descriptions** — "Backend role at Stripe, values Python and distributed systems" beats "apply for backend role"
-2. **Test on yourself first** — put your own email in row 1 and check the output looks good
-3. **Iterate on context.md** — if emails feel off, refine the context with examples and tone notes
-4. **Use real filenames** — name your files clearly (`resume_2024.pdf`, not `doc1.pdf`) so the AI matches them correctly
-5. **Run small batches first** — try 3–5 contacts before sending to 50
-6. **Don't skip the delay** — even 30 seconds between sends makes a huge difference for deliverability
+Be specific. The more context, the better the emails. Examples:
 
----
+**For job applications:**
+- Your name, current role, years of experience
+- The kind of roles you're targeting
+- 2-3 standout achievements
+- Your portfolio/LinkedIn URLs
+- Tone you want (professional, friendly, technical)
 
-## What's NOT included (you'd need to add yourself)
+**For event invites:**
+- Event details (date, time, venue, dress code)
+- Why you're inviting people
+- What you want them to do (RSVP, share, bring something)
 
-- Email reply tracking — this only sends, doesn't monitor responses
-- A/B testing of subject lines
-- Web UI — this is a CLI tool
-- Multiple email account rotation — uses one Gmail account
-- Email warmup — if your Gmail is brand new, send a few personal emails first
+**For sales follow-ups:**
+- Your product and value prop
+- Common objections to address
+- What action you want them to take
 
 ---
 
