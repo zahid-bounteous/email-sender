@@ -109,8 +109,8 @@ Required columns (lowercase, exactly these names):
 
 | name | email | description | file_hint |
 |---|---|---|---|
-| Priya Sharma | priya@stripe.com | Backend Engineer role at Stripe — values distributed systems experience | resume |
-| Anna Mueller | anna@techcorp.com | Following up on our LinkedIn chat about their platform team | NA |
+| Monkey Song | monkey@tripe.com | Backend Engineer role at Stripe — values distributed systems experience | resume |
+| Anna Filler | anna@techcorp.com | Following up on our LinkedIn chat about their platform team | NA |
 
 - **name** — recipient's name
 - **email** — their email address
